@@ -40,7 +40,7 @@ def sse(data: dict | str, event: str = "message") -> str:
 def repair_record_payload(missing: MissingPunch | None) -> dict:
     if not missing:
         return {"repair_record": None}
-    punch_label = "\u4e0a\u73ed\u5361" if missing.punch_type.value == "ON_DUTY" else "\u4e0b\u73ed\u5361"
+    punch_label = "上班卡" if missing.punch_type.value == "ON_DUTY" else "下班卡"
     return {
         "repair_record": {
             "id": missing.id,
@@ -55,15 +55,15 @@ def repair_record_payload(missing: MissingPunch | None) -> dict:
 def repair_result_payload(status: str, current_node: str, terminal: bool, missing: MissingPunch | None = None) -> dict:
     payload = repair_record_payload(missing)
     if not terminal:
-        payload.update({"result_status": "IN_PROGRESS", "result_message": "\u672c\u8f6e\u5bf9\u8bdd\u5c1a\u672a\u7ed3\u675f\uff0c\u8bf7\u7ee7\u7eed\u6309\u63d0\u793a\u64cd\u4f5c\u3002"})
+        payload.update({"result_status": "IN_PROGRESS", "result_message": "本轮对话尚未结束，请继续按提示操作。"})
     elif status == "DONE":
-        payload.update({"result_status": "SUCCESS", "result_message": "\u8865\u5361\u6210\u529f\uff0c\u5f53\u524d\u8bb0\u5f55\u5df2\u81ea\u52a8\u8865\u5361\u5b8c\u6210\u3002"})
+        payload.update({"result_status": "SUCCESS", "result_message": "补卡成功，当前记录已自动补卡完成。"})
     elif status == "WAITING_APPROVAL":
-        payload.update({"result_status": "PENDING_APPROVAL", "result_message": "\u5df2\u63d0\u4ea4\u9886\u5bfc\u5ba1\u6838\uff0c\u9886\u5bfc\u901a\u8fc7\u540e\u4f1a\u81ea\u52a8\u8865\u5361\u3002"})
+        payload.update({"result_status": "PENDING_APPROVAL", "result_message": "已提交领导审核，领导通过后会自动补卡。"})
     elif status == "FAILED":
-        payload.update({"result_status": "FAILED", "result_message": "\u8865\u5361\u5931\u8d25\uff0c\u8bf7\u67e5\u770b\u804a\u5929\u5185\u5bb9\u4e2d\u7684\u5931\u8d25\u539f\u56e0\u3002"})
+        payload.update({"result_status": "FAILED", "result_message": "补卡失败，请查看聊天内容中的失败原因。"})
     else:
-        payload.update({"result_status": "FAILED", "result_message": "\u672c\u8f6e\u8865\u5361\u6d41\u7a0b\u5df2\u7ed3\u675f\uff0c\u4f46\u6ca1\u6709\u5b8c\u6210\u8865\u5361\uff0c\u8bf7\u67e5\u770b\u804a\u5929\u5185\u5bb9\u786e\u8ba4\u539f\u56e0\u3002"})
+        payload.update({"result_status": "FAILED", "result_message": "本轮补卡流程已结束，但没有完成补卡，请查看聊天内容确认原因。"})
     return payload
 
 
@@ -115,7 +115,7 @@ async def agent_chat(data: AgentChatRequest, db: AsyncSession = Depends(get_db),
             yield sse({"type": "session", "session_id": chat.id, "title": chat.title}, event="session")
         elif chat.current_node == "end" or chat.status in {"DONE", "WAITING_APPROVAL", "FAILED"}:
             missing = await db.get(MissingPunch, chat.missing_punch_id) if chat.missing_punch_id else None
-            yield sse({"type": "text", "content": "\u672c\u8f6e\u8865\u5361\u6d41\u7a0b\u5df2\u7ecf\u7ed3\u675f\uff0c\u4e0d\u80fd\u7ee7\u7eed\u5728\u8be5\u4f1a\u8bdd\u8f93\u5165\u3002\u8bf7\u70b9\u51fb\u300e\u65b0\u4f1a\u8bdd\u300f\u91cd\u65b0\u5f00\u59cb\u3002", "session_id": chat.id})
+            yield sse({"type": "text", "content": "本轮补卡流程已经结束，不能继续在该会话输入。请点击『新会话』重新开始。", "session_id": chat.id})
             yield sse({"type": "done", "session_id": chat.id, "status": chat.status, "current_node": chat.current_node, "terminal": True, **repair_result_payload(chat.status, chat.current_node, True, missing)}, event="done")
             return
         await add_chat_message(db, chat.id, "user", data.message)
@@ -128,8 +128,8 @@ async def agent_chat(data: AgentChatRequest, db: AsyncSession = Depends(get_db),
                 result = await db.execute(select(MissingPunch).where(MissingPunch.id == selected_id, MissingPunch.user_id == current_user.id))
                 missing = result.scalar_one_or_none()
                 if missing:
-                    punch_label = "\u4e0a\u73ed\u5361" if missing.punch_type.value == "ON_DUTY" else "\u4e0b\u73ed\u5361"
-                    chat = await bind_missing_punch(db, chat, missing.id, f"{missing.work_date:%Y-%m-%d} {punch_label}\u8865\u5361")
+                    punch_label = "上班卡" if missing.punch_type.value == "ON_DUTY" else "下班卡"
+                    chat = await bind_missing_punch(db, chat, missing.id, f"{missing.work_date:%Y-%m-%d} {punch_label}补卡")
                 continue
             if event.get("type") == "node":
                 current_node = event["node"]
@@ -138,11 +138,11 @@ async def agent_chat(data: AgentChatRequest, db: AsyncSession = Depends(get_db),
                 continue
             chunk = event["content"]
             await add_chat_message(db, chat.id, "agent", chunk)
-            if "\u81ea\u52a8\u8865\u5361\u5b8c\u6210" in chunk:
+            if "自动补卡完成" in chunk:
                 final_status = "DONE"
-            elif "\u5df2\u63d0\u4ea4\u9886\u5bfc\u5ba1\u6838" in chunk:
+            elif "已提交领导审核" in chunk:
                 final_status = "WAITING_APPROVAL"
-            elif any(keyword in chunk for keyword in ["\u5931\u8d25", "\u65e0\u6cd5\u521b\u5efa", "\u6ca1\u6709\u627e\u5230\u8fd9\u6761\u53ef\u8865\u5361\u6570\u636e"]):
+            elif any(keyword in chunk for keyword in ["失败", "无法创建", "没有找到这条可补卡数据"]):
                 final_status = "FAILED"
             yield sse({"type": "text", "content": chunk, "session_id": chat.id})
         terminal = current_node == "end"
@@ -172,15 +172,15 @@ async def agent_select(data: ChatSelectRequest, db: AsyncSession = Depends(get_d
     async def gen() -> AsyncIterator[str]:
         chat = await get_owned_session(db, current_user, data.session_id) if data.session_id else None
         if not chat:
-            chat = await create_chat_session(db, current_user, title=f"\u8865\u5361\u8bb0\u5f55 #{data.missing_punch_id}")
+            chat = await create_chat_session(db, current_user, title=f"补卡记录 #{data.missing_punch_id}")
             yield sse({"type": "session", "session_id": chat.id, "title": chat.title}, event="session")
         result = await db.execute(select(MissingPunch).where(MissingPunch.id == data.missing_punch_id, MissingPunch.user_id == current_user.id))
         missing = result.scalar_one_or_none()
         if missing:
-            punch_label = '\u4e0a\u73ed\u5361' if missing.punch_type.value == 'ON_DUTY' else '\u4e0b\u73ed\u5361'
-            title = f"{missing.work_date:%Y-%m-%d} {punch_label}\u8865\u5361"
+            punch_label = '上班卡' if missing.punch_type.value == 'ON_DUTY' else '下班卡'
+            title = f"{missing.work_date:%Y-%m-%d} {punch_label}补卡"
             chat = await bind_missing_punch(db, chat, missing.id, title)
-        await add_chat_message(db, chat.id, "user", f"\u9009\u62e9\u8865\u5361\u8bb0\u5f55 #{data.missing_punch_id}")
+        await add_chat_message(db, chat.id, "user", f"选择补卡记录 #{data.missing_punch_id}")
         agent = AutoClockAgent(db, current_user)
         final_status = "DONE"
         current_node = chat.current_node
@@ -192,11 +192,11 @@ async def agent_select(data: ChatSelectRequest, db: AsyncSession = Depends(get_d
                 continue
             chunk = event["content"]
             await add_chat_message(db, chat.id, "agent", chunk)
-            if "\u81ea\u52a8\u8865\u5361\u5b8c\u6210" in chunk:
+            if "自动补卡完成" in chunk:
                 final_status = "DONE"
-            elif "\u5df2\u63d0\u4ea4\u9886\u5bfc\u5ba1\u6838" in chunk:
+            elif "已提交领导审核" in chunk:
                 final_status = "WAITING_APPROVAL"
-            elif any(keyword in chunk for keyword in ["\u5931\u8d25", "\u65e0\u6cd5\u521b\u5efa", "\u6ca1\u6709\u627e\u5230\u8fd9\u6761\u53ef\u8865\u5361\u6570\u636e"]):
+            elif any(keyword in chunk for keyword in ["失败", "无法创建", "没有找到这条可补卡数据"]):
                 final_status = "FAILED"
             yield sse({"type": "text", "content": chunk, "session_id": chat.id})
         terminal = current_node == "end"

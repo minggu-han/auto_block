@@ -100,7 +100,7 @@ async def resolve_missing_for_session(db: AsyncSession, session: ChatSession, me
         messages = list((await db.execute(select(ChatMessage).where(ChatMessage.session_id == session.id))).scalars().all())
     approval_id = None
     for message in reversed(messages):
-        match = re.search(r"\u5ba1\u6838\u5355\u53f7[:\uff1a]\s*(\d+)", message.content)
+        match = re.search(r"审核单号[:：]\s*(\d+)", message.content)
         if match:
             approval_id = int(match.group(1))
             break
