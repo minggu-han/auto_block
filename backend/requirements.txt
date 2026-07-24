@@ -1,0 +1,14 @@
+﻿# Python 3.13 兼容版本；旧版 langchain 会拉取 numpy 1.26.x，Windows + Python 3.13 无可用 wheel 时会尝试本地编译并失败。
+fastapi>=0.115.0,<1.0.0
+uvicorn[standard]>=0.34.0,<1.0.0
+SQLAlchemy[asyncio]>=2.0.38,<3.0.0
+asyncpg>=0.30.0,<1.0.0
+pydantic>=2.10.0,<3.0.0
+pydantic-settings>=2.8.0,<3.0.0
+python-jose[cryptography]>=3.3.0,<4.0.0
+passlib[bcrypt]>=1.7.4,<2.0.0
+python-multipart>=0.0.20,<1.0.0
+numpy>=2.1.0,<3.0.0
+langchain>=0.3.27,<0.4.0
+langgraph>=0.5.4,<0.7.0
+langchain-openai>=0.3.0,<0.4.0
