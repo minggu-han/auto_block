@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 import json
@@ -27,6 +27,8 @@ def _punch_label(value: str) -> str:
     return "上班卡" if value == "ON_DUTY" else "下班卡"
 
 
+# LangGraph 中流转的状态对象。
+# 每个节点会读取/写入这里的字段，比如 missing_punch_id、next、leader_id 等。
 class RepairState(TypedDict, total=False):
     user_id: int
     user_message: str
@@ -37,6 +39,8 @@ class RepairState(TypedDict, total=False):
     approval_id: int | None
 
 
+# OpenAI 意图理解后的标准输出结构。
+# 后续业务逻辑只认这三种 intent，避免直接依赖大模型自由文本。
 class UserIntent(TypedDict):
     intent: Literal["list_records", "select_record", "other"]
     selected_id: int | None
@@ -58,6 +62,10 @@ class AutoClockAgent:
         self._select_graph = self._build_select_graph()
 
     def _build_select_graph(self):
+        # 这里定义真正的补卡流程图：
+        # 1. 加载用户选择的补卡记录
+        # 2. 查询领导和审核配置
+        # 3. 根据配置进入自动补卡或提交审核
         graph = StateGraph(RepairState)
         graph.add_node("load_selected_record", self.load_selected_record)
         graph.add_node("check_leader_policy", self.check_leader_policy)
@@ -83,6 +91,8 @@ class AutoClockAgent:
         return AIMessage(content=text)
 
     async def _open_items(self) -> list[MissingPunch]:
+        # 工具能力：查询当前用户还可以处理的补卡记录。
+        # only_open=True 只返回 PENDING / APPROVAL_PENDING 状态的数据。
         return await list_my_missing_punches(self.db, self.user, only_open=True)
 
     def _format_items(self, items: list[MissingPunch]) -> str:
@@ -95,12 +105,15 @@ class AutoClockAgent:
         return "\n".join(lines)
 
     async def _load_recent_messages(self, session_id: int | None) -> list[ChatMessage]:
+        # 加载最近聊天历史给 OpenAI，解决“选第1条”这类依赖上下文的问题。
         if not session_id:
             return []
         result = await self.db.execute(select(ChatMessage).where(ChatMessage.session_id == session_id).order_by(ChatMessage.id.desc()).limit(12))
         return list(reversed(result.scalars().all()))
 
     def _heuristic_intent(self, message: str, items: list[MissingPunch]) -> UserIntent:
+        # OpenAI 未配置或调用失败时的兜底规则。
+        # 只做简单关键词/编号识别，保证系统最低限度可用。
         text = message.strip()
         if re.search(r"(补卡|忘记打卡|漏打卡|缺卡|打卡)", text):
             id_match = re.search(r"(?:编号|#)\s*(\d+)", text)
@@ -122,6 +135,8 @@ class AutoClockAgent:
         return {"intent": "other", "selected_id": None, "reply": "我可以帮你处理补卡。请直接告诉我“我要补卡”，我会查询你的待补卡数据。"}
 
     async def understand_user_message(self, message: str, session_id: int | None = None) -> UserIntent:
+        # 使用 OpenAI 把用户自然语言转换为结构化意图。
+        # 注意：大模型只负责“理解”，真正查询/补卡/审核仍由后端工具函数执行。
         items = await self._open_items()
         history = await self._load_recent_messages(session_id)
         if not settings.openai_api_key or ChatOpenAI is None:
@@ -156,7 +171,18 @@ class AutoClockAgent:
         )
         try:
             resp = await llm.ainvoke([SystemMessage(content=system), HumanMessage(content=prompt)])
+            #将 LLM 响应内容转换为字符串
+            #   如果 resp.content 已经是字符串 → 直接使用
+            #   如果 resp.content 是其他类型（如列表、字典）→ 使用 json.dumps() 转为 JSON 字符串
+            #   ensure_ascii=False：保留非 ASCII 字符（如中文），不转义为 \uXXXX
             raw = resp.content if isinstance(resp.content, str) else json.dumps(resp.content, ensure_ascii=False)
+            #使用正则表达式在 raw 字符串中搜索 JSON 对象
+            # 正则解析：
+            # 1、    \{：匹配左花括号
+            # 2、   . *：匹配任意字符（0个或多个）
+            # 3、    \}：匹配右花括号
+            # 4、    re.S 标志：让.匹配换行符，实现跨行匹配
+            # match 是匹配对象，如果找到返回匹配对象，否则返回 None
             match = re.search(r"\{.*\}", raw, re.S)
             data = json.loads(match.group(0) if match else raw)
             intent = data.get("intent")
@@ -175,6 +201,8 @@ class AutoClockAgent:
                 yield event["content"]
 
     async def stream_chat_events(self, message: str, session_id: int | None = None):
+        # 统一聊天入口：先理解意图，再按意图分发。
+        # 这里产出的事件会被 API 层转成 SSE 推给前端。
         yield {"type": "node", "node": "understand_user_message"}
         intent = await self.understand_user_message(message, session_id)
         if intent["intent"] == "list_records":
@@ -192,6 +220,7 @@ class AutoClockAgent:
         yield {"type": "text", "content": intent.get("reply") or "我可以帮你处理补卡。请告诉我“我要补卡”，或在我列出数据后回复要补哪一条。"}
 
     async def load_selected_record(self, state: RepairState) -> RepairState:
+        # LangGraph 节点1：校验用户选择的补卡记录是否存在、是否属于本人、状态是否允许处理。
         missing_id = state.get("missing_punch_id")
         result = await self.db.execute(
             select(MissingPunch).where(
@@ -208,6 +237,7 @@ class AutoClockAgent:
         return {"messages": [msg], "next": "check_leader_policy"}
 
     async def check_leader_policy(self, state: RepairState) -> RepairState:
+        # LangGraph 节点2：查询领导，并根据领导是否开启自动审核决定下一步。
         if not self.user.leader_id:
             msg = await self._emit("未配置领导，无法进入审核；系统将按无领导场景直接自动补卡。")
             return {"messages": [msg], "next": "auto_repair", "leader_id": None}
@@ -223,6 +253,7 @@ class AutoClockAgent:
         return {"messages": [msg], "next": "request_leader_approval", "leader_id": leader.id}
 
     async def auto_repair(self, state: RepairState) -> RepairState:
+        # LangGraph 节点3A：自动补卡。当前实现是更新本系统数据库状态，尚未接入真实考勤系统。
         result = await self.db.execute(select(MissingPunch).where(MissingPunch.id == state.get("missing_punch_id"), MissingPunch.user_id == self.user.id))
         missing = result.scalar_one_or_none()
         if not missing:
@@ -232,6 +263,7 @@ class AutoClockAgent:
         return {"messages": [msg]}
 
     async def request_leader_approval(self, state: RepairState) -> RepairState:
+        # LangGraph 节点3B：领导未开启自动审核时，创建或复用待审核单。
         leader_id = state.get("leader_id")
         if not leader_id:
             return {"messages": [AIMessage(content="无法创建审核单：领导不存在。")]} 
@@ -250,6 +282,7 @@ class AutoClockAgent:
                 yield event["content"]
 
     async def stream_select_events(self, missing_punch_id: int):
+        # 执行 LangGraph，并把每个节点名与节点输出文本转换成事件，方便前端实时展示流程节点。
         async for event in self._select_graph.astream({"user_id": self.user.id, "missing_punch_id": missing_punch_id}):
             for node_name, state in event.items():
                 yield {"type": "node", "node": node_name}

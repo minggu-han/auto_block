@@ -1,4 +1,4 @@
-﻿import json
+import json
 from collections.abc import AsyncIterator
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -32,11 +32,15 @@ from app.services.chat_service import add_chat_message, bind_missing_punch, crea
 router = APIRouter(prefix="/api")
 
 
+# 将普通 dict 包装成 SSE 文本格式。
+# 前端通过 fetch reader 按 "\n\n" 拆分事件。
 def sse(data: dict | str, event: str = "message") -> str:
     payload = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False, default=str)
+    print(f'event: {event}\ndata: {payload}\n\n')
     return f"event: {event}\ndata: {payload}\n\n"
 
 
+# 统一生成“本轮补卡结果”里的补卡记录信息，前端结果卡片直接使用。
 def repair_record_payload(missing: MissingPunch | None) -> dict:
     if not missing:
         return {"repair_record": None}
@@ -52,6 +56,7 @@ def repair_record_payload(missing: MissingPunch | None) -> dict:
     }
 
 
+# 根据会话状态生成结果文案：成功、等待审核、失败、处理中。
 def repair_result_payload(status: str, current_node: str, terminal: bool, missing: MissingPunch | None = None) -> dict:
     payload = repair_record_payload(missing)
     if not terminal:
@@ -107,13 +112,21 @@ async def chat_session_detail(session_id: int, db: AsyncSession = Depends(get_db
 
 @router.post("/agent/chat")
 async def agent_chat(data: AgentChatRequest, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+    # 补卡聊天主接口：
+    # 1. 创建或恢复聊天会话
+    # 2. 保存用户消息
+    # 3. 调用 Agent 产生节点事件和文本事件
+    # 4. 保存 Agent 消息并以 SSE 流式返回给前端
     async def gen() -> AsyncIterator[str]:
+        # 首次对话session_id为None
         chat = await get_owned_session(db, current_user, data.session_id) if data.session_id else None
         if not chat:
+            #首次对话
             title = data.message[:40] if data.message else "补卡会话"
             chat = await create_chat_session(db, current_user, title=title or "补卡会话")
             yield sse({"type": "session", "session_id": chat.id, "title": chat.title}, event="session")
         elif chat.current_node == "end" or chat.status in {"DONE", "WAITING_APPROVAL", "FAILED"}:
+            # 后端兜底：已结束的会话不允许继续聊天，避免绕过前端禁用输入框。
             missing = await db.get(MissingPunch, chat.missing_punch_id) if chat.missing_punch_id else None
             yield sse({"type": "text", "content": "本轮补卡流程已经结束，不能继续在该会话输入。请点击『新会话』重新开始。", "session_id": chat.id})
             yield sse({"type": "done", "session_id": chat.id, "status": chat.status, "current_node": chat.current_node, "terminal": True, **repair_result_payload(chat.status, chat.current_node, True, missing)}, event="done")
@@ -124,6 +137,7 @@ async def agent_chat(data: AgentChatRequest, db: AsyncSession = Depends(get_db),
         current_node = chat.current_node
         async for event in agent.stream_chat_events(data.message, chat.id):
             if event.get("type") == "selected_record":
+                # 用户已经选择某条补卡记录：把聊天会话和补卡记录绑定，历史回看和领导审核同步都依赖这个关联。
                 selected_id = event["missing_punch_id"]
                 result = await db.execute(select(MissingPunch).where(MissingPunch.id == selected_id, MissingPunch.user_id == current_user.id))
                 missing = result.scalar_one_or_none()
@@ -132,6 +146,7 @@ async def agent_chat(data: AgentChatRequest, db: AsyncSession = Depends(get_db),
                     chat = await bind_missing_punch(db, chat, missing.id, f"{missing.work_date:%Y-%m-%d} {punch_label}补卡")
                 continue
             if event.get("type") == "node":
+                # 节点事件只更新 current_node，不作为聊天消息保存。
                 current_node = event["node"]
                 await update_session_node(db, chat, current_node)
                 yield sse({"type": "node", "node": current_node, "session_id": chat.id}, event="node")
@@ -215,6 +230,8 @@ async def approvals(db: AsyncSession = Depends(get_db), current_user: User = Dep
 
 @router.post("/approvals/{approval_id}/review")
 async def review(approval_id: int, data: ApprovalReviewRequest, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
+    # 领导审核接口：审核通过会触发自动补卡；审核拒绝会把补卡记录标记为 REJECTED。
+    # 同时需要同步关联聊天会话状态，否则员工回到聊天页仍会看到“等待领导审核”。
     result = await db.execute(select(RepairApproval).where(RepairApproval.id == approval_id, RepairApproval.leader_id == current_user.id))
     approval = result.scalar_one_or_none()
     if not approval:

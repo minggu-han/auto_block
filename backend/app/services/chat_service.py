@@ -1,4 +1,4 @@
-﻿from datetime import datetime, timezone
+from datetime import datetime, timezone
 
 import re
 
@@ -20,6 +20,7 @@ async def create_chat_session(db: AsyncSession, user: User, title: str = "补卡
 
 
 async def add_chat_message(db: AsyncSession, session_id: int, role: str, content: str) -> ChatMessage:
+    # 保存一条聊天消息，并顺手更新会话 updated_at，保证聊天列表按最近活跃排序。
     msg = ChatMessage(session_id=session_id, role=role, content=content)
     db.add(msg)
     session = await db.get(ChatSession, session_id)
@@ -31,6 +32,8 @@ async def add_chat_message(db: AsyncSession, session_id: int, role: str, content
 
 
 async def bind_missing_punch(db: AsyncSession, session: ChatSession, missing_punch_id: int, title: str | None = None) -> ChatSession:
+    # 关键关联：把聊天会话绑定到具体补卡记录。
+    # 后续结果展示、领导审核后状态同步、历史记录回看都依赖 missing_punch_id。
     session.missing_punch_id = missing_punch_id
     if title:
         session.title = title
@@ -63,6 +66,7 @@ async def get_owned_session(db: AsyncSession, user: User, session_id: int) -> Ch
 
 
 def status_from_missing(session_status: str, missing: MissingPunch | None) -> str:
+    # 根据补卡记录的真实状态兜底修正聊天会话状态，兼容历史数据未同步的情况。
     if not missing:
         return session_status
     if missing.status == MissingPunchStatus.repaired:
@@ -92,6 +96,8 @@ async def persist_session_status_from_missing(db: AsyncSession, session: ChatSes
 
 
 async def resolve_missing_for_session(db: AsyncSession, session: ChatSession, messages: list[ChatMessage] | None = None) -> MissingPunch | None:
+    # 获取会话对应的补卡记录。
+    # 优先使用 session.missing_punch_id；如果历史数据没有绑定，则从聊天消息中的“审核单号”反查。
     if session.missing_punch_id:
         missing = await db.get(MissingPunch, session.missing_punch_id)
         await persist_session_status_from_missing(db, session, missing)
@@ -115,11 +121,13 @@ async def resolve_missing_for_session(db: AsyncSession, session: ChatSession, me
 
 
 async def sync_sessions_for_missing_punch(db: AsyncSession, missing_punch_id: int, status: str, approval_id: int | None = None) -> None:
+    # 领导审核完成后，同步所有关联到该补卡记录的聊天会话状态。
+    # approval_id 用于兼容旧会话：旧数据可能未绑定 missing_punch_id，只能从消息里的审核单号反查。
     result = await db.execute(select(ChatSession).where(ChatSession.missing_punch_id == missing_punch_id))
     sessions = list(result.scalars().all())
 
-    # ????????? /agent/chat ????????? missing_punch_id?
-    # ???????????????x??????????????????
+    # 兼容历史会话：之前 /agent/chat 选择记录时没有绑定 missing_punch_id，
+    # 但聊天消息里保存了“审核单号：x”，可用审核单号反查对应会话并补绑。
     if approval_id is not None:
         approval_pattern = f"%{approval_id}%"
         fallback = await db.execute(
@@ -146,6 +154,7 @@ async def sync_sessions_for_missing_punch(db: AsyncSession, missing_punch_id: in
 
 
 async def list_chat_sessions(db: AsyncSession, user: User) -> list[ChatSessionOut]:
+    # 聊天左侧历史列表：返回会话摘要、最后一条消息、补卡记录摘要和修正后的状态。
     msg_count = select(ChatMessage.session_id, func.count(ChatMessage.id).label("cnt")).group_by(ChatMessage.session_id).subquery()
     last_msg_id = select(ChatMessage.session_id, func.max(ChatMessage.id).label("max_id")).group_by(ChatMessage.session_id).subquery()
     last_msg = select(ChatMessage.session_id, ChatMessage.content).join(last_msg_id, ChatMessage.id == last_msg_id.c.max_id).subquery()
@@ -186,6 +195,7 @@ async def list_chat_sessions(db: AsyncSession, user: User) -> list[ChatSessionOu
 
 
 async def get_chat_session_detail(db: AsyncSession, user: User, session_id: int) -> ChatSessionDetailOut | None:
+    # 点击左侧聊天记录时调用：返回完整消息和本次会话针对的补卡数据。
     session = await get_owned_session(db, user, session_id)
     if not session:
         return None
