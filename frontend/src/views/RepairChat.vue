@@ -98,10 +98,9 @@ function statusLabel(s){ return ({ ACTIVE:'进行中', DONE:'已完成', WAITING
 function labelPunch(t){ if (!t) return '未知类型'; return t === 'ON_DUTY' ? '上班卡' : '下班卡' }
 function nodeLabel(n){
   return ({
-    start:'开始', understand_user_message:'理解用户意图', query_missing_punches:'查询可补卡数据',
+    start:'开始', query_missing_punches:'查询可补卡数据',
     waiting_user_selection:'等待用户选择补卡数据', waiting_user_intent:'等待用户说明补卡需求',
-    load_selected_record:'加载用户选择的补卡记录', check_leader_policy:'查询领导与审核配置',
-    auto_repair:'自动补卡', request_leader_approval:'提交领导审核', end:'流程结束'
+    repair_missing_punch:'执行补卡（自动补卡 / 提交审核）', end:'流程结束'
   })[n] || n || '开始'
 }
 function resultStatusFromSession(status, node){

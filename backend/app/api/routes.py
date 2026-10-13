@@ -15,7 +15,6 @@ from app.schemas.schemas import (
     ApprovalOut,
     ApprovalReviewRequest,
     AgentChatRequest,
-    ChatSelectRequest,
     ChatSessionDetailOut,
     ChatSessionOut,
     LoginRequest,
@@ -27,7 +26,7 @@ from app.schemas.schemas import (
 from app.services.agent import AutoClockAgent
 from app.services.attendance_service import create_missing_punch, list_leader_approvals, list_my_missing_punches, review_approval
 from app.services.auth_service import authenticate_user
-from app.services.chat_service import add_chat_message, bind_missing_punch, create_chat_session, finish_session, get_chat_session_detail, get_owned_session, list_chat_sessions, sync_sessions_for_missing_punch, update_session_node
+from app.services.chat_service import add_chat_message, create_chat_session, finish_session, get_chat_session_detail, get_owned_session, list_chat_sessions, sync_sessions_for_missing_punch, update_session_node
 
 router = APIRouter(prefix="/api")
 
@@ -112,16 +111,16 @@ async def chat_session_detail(session_id: int, db: AsyncSession = Depends(get_db
 
 @router.post("/agent/chat")
 async def agent_chat(data: AgentChatRequest, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
-    # 补卡聊天主接口：
+    # 补卡聊天主接口（ReAct Agent）：
     # 1. 创建或恢复聊天会话
     # 2. 保存用户消息
-    # 3. 调用 Agent 产生节点事件和文本事件
-    # 4. 保存 Agent 消息并以 SSE 流式返回给前端
+    # 3. 由 ReAct Agent 自主决定调用工具（查询 / 补卡）
+    # 4. 以 SSE 流式返回文本与节点事件
     async def gen() -> AsyncIterator[str]:
-        # 首次对话session_id为None
+        # 首次对话 session_id 为 None
         chat = await get_owned_session(db, current_user, data.session_id) if data.session_id else None
         if not chat:
-            #首次对话
+            # 首次对话
             title = data.message[:40] if data.message else "补卡会话"
             chat = await create_chat_session(db, current_user, title=title or "补卡会话")
             yield sse({"type": "session", "session_id": chat.id, "title": chat.title}, event="session")
@@ -133,90 +132,19 @@ async def agent_chat(data: AgentChatRequest, db: AsyncSession = Depends(get_db),
             return
         await add_chat_message(db, chat.id, "user", data.message)
         agent = AutoClockAgent(db, current_user)
-        final_status = "ACTIVE"
-        current_node = chat.current_node
-        async for event in agent.stream_chat_events(data.message, chat.id):
-            if event.get("type") == "selected_record":
-                # 用户已经选择某条补卡记录：把聊天会话和补卡记录绑定，历史回看和领导审核同步都依赖这个关联。
-                selected_id = event["missing_punch_id"]
-                result = await db.execute(select(MissingPunch).where(MissingPunch.id == selected_id, MissingPunch.user_id == current_user.id))
-                missing = result.scalar_one_or_none()
-                if missing:
-                    punch_label = "上班卡" if missing.punch_type.value == "ON_DUTY" else "下班卡"
-                    chat = await bind_missing_punch(db, chat, missing.id, f"{missing.work_date:%Y-%m-%d} {punch_label}补卡")
-                continue
+        async for event in agent.stream_chat_events(data.message, chat):
             if event.get("type") == "node":
                 # 节点事件只更新 current_node，不作为聊天消息保存。
-                current_node = event["node"]
-                await update_session_node(db, chat, current_node)
-                yield sse({"type": "node", "node": current_node, "session_id": chat.id}, event="node")
+                await update_session_node(db, chat, event["node"])
+                yield sse({"type": "node", "node": event["node"], "session_id": chat.id}, event="node")
                 continue
-            chunk = event["content"]
-            await add_chat_message(db, chat.id, "agent", chunk)
-            if "自动补卡完成" in chunk:
-                final_status = "DONE"
-            elif "已提交领导审核" in chunk:
-                final_status = "WAITING_APPROVAL"
-            elif any(keyword in chunk for keyword in ["失败", "无法创建", "没有找到这条可补卡数据"]):
-                final_status = "FAILED"
-            yield sse({"type": "text", "content": chunk, "session_id": chat.id})
-        terminal = current_node == "end"
-        if terminal and final_status == "ACTIVE":
-            final_status = "FAILED"
-        await finish_session(db, chat, final_status, current_node=current_node)
-        missing = await db.get(MissingPunch, chat.missing_punch_id) if chat.missing_punch_id else None
-        yield sse({"type": "done", "session_id": chat.id, "status": final_status, "current_node": current_node, "terminal": terminal, **repair_result_payload(final_status, current_node, terminal, missing)}, event="done")
-    return StreamingResponse(gen(), media_type="text/event-stream")
-
-@router.post("/agent/start")
-async def agent_start(db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
-    async def gen() -> AsyncIterator[str]:
-        chat = await create_chat_session(db, current_user, title="补卡会话")
-        await add_chat_message(db, chat.id, "user", "开始补卡")
-        yield sse({"type": "session", "session_id": chat.id, "title": chat.title}, event="session")
-        agent = AutoClockAgent(db, current_user)
-        async for chunk in agent.stream_chat("我要补卡", chat.id):
-            await add_chat_message(db, chat.id, "agent", chunk)
-            yield sse({"type": "text", "content": chunk, "session_id": chat.id})
-        yield sse({"type": "done", "session_id": chat.id}, event="done")
-    return StreamingResponse(gen(), media_type="text/event-stream")
-
-
-@router.post("/agent/select")
-async def agent_select(data: ChatSelectRequest, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user)):
-    async def gen() -> AsyncIterator[str]:
-        chat = await get_owned_session(db, current_user, data.session_id) if data.session_id else None
-        if not chat:
-            chat = await create_chat_session(db, current_user, title=f"补卡记录 #{data.missing_punch_id}")
-            yield sse({"type": "session", "session_id": chat.id, "title": chat.title}, event="session")
-        result = await db.execute(select(MissingPunch).where(MissingPunch.id == data.missing_punch_id, MissingPunch.user_id == current_user.id))
-        missing = result.scalar_one_or_none()
-        if missing:
-            punch_label = '上班卡' if missing.punch_type.value == 'ON_DUTY' else '下班卡'
-            title = f"{missing.work_date:%Y-%m-%d} {punch_label}补卡"
-            chat = await bind_missing_punch(db, chat, missing.id, title)
-        await add_chat_message(db, chat.id, "user", f"选择补卡记录 #{data.missing_punch_id}")
-        agent = AutoClockAgent(db, current_user)
-        final_status = "DONE"
-        current_node = chat.current_node
-        async for event in agent.stream_select_events(data.missing_punch_id):
-            if event.get("type") == "node":
-                current_node = event["node"]
-                await update_session_node(db, chat, current_node)
-                yield sse({"type": "node", "node": current_node, "session_id": chat.id}, event="node")
-                continue
-            chunk = event["content"]
-            await add_chat_message(db, chat.id, "agent", chunk)
-            if "自动补卡完成" in chunk:
-                final_status = "DONE"
-            elif "已提交领导审核" in chunk:
-                final_status = "WAITING_APPROVAL"
-            elif any(keyword in chunk for keyword in ["失败", "无法创建", "没有找到这条可补卡数据"]):
-                final_status = "FAILED"
-            yield sse({"type": "text", "content": chunk, "session_id": chat.id})
-        terminal = current_node == "end"
-        if terminal and final_status == "ACTIVE":
-            final_status = "FAILED"
+            # 文本事件：保存为 agent 消息并透传给前端。
+            await add_chat_message(db, chat.id, "agent", event["content"])
+            yield sse({"type": "text", "content": event["content"], "session_id": chat.id})
+        outcome = agent.outcome or {}
+        terminal = bool(outcome.get("terminal"))
+        final_status = outcome.get("status", "ACTIVE")
+        current_node = "end" if terminal else outcome.get("current_node", "waiting_user_intent")
         await finish_session(db, chat, final_status, current_node=current_node)
         missing = await db.get(MissingPunch, chat.missing_punch_id) if chat.missing_punch_id else None
         yield sse({"type": "done", "session_id": chat.id, "status": final_status, "current_node": current_node, "terminal": terminal, **repair_result_payload(final_status, current_node, terminal, missing)}, event="done")

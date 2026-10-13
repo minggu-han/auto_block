@@ -22,7 +22,7 @@
 ```powershell
 cd backend
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+.\.venv\Scripts\activate
 python -m pip install -r requirements.txt
 copy .env.example .env
 # 编辑 .env，填写 OPENAI_API_KEY；如使用兼容 OpenAI 的网关，可填写 OPENAI_BASE_URL
@@ -52,5 +52,4 @@ npm run dev
 ```text
 postgresql+asyncpg://mcp:mcp@172.18.1.76:5432/mcp
 ```
-
 

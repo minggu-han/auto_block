@@ -46,15 +46,6 @@ class AgentChatRequest(BaseModel):
     session_id: int | None = None
 
 
-class ChatStartRequest(BaseModel):
-    message: str | None = None
-
-
-class ChatSelectRequest(BaseModel):
-    missing_punch_id: int
-    session_id: int | None = None
-
-
 class ApprovalOut(BaseModel):
     id: int
     missing_punch_id: int
