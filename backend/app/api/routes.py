@@ -146,6 +146,8 @@ async def agent_chat(data: AgentChatRequest, db: AsyncSession = Depends(get_db),
         final_status = outcome.get("status", "ACTIVE")
         current_node = "end" if terminal else outcome.get("current_node", "waiting_user_intent")
         await finish_session(db, chat, final_status, current_node=current_node)
+        # 滑动窗口 + 摘要：窗口之外的旧消息压缩进 chat.summary，控制下轮上下文长度。
+        await agent.refresh_summary(chat)
         missing = await db.get(MissingPunch, chat.missing_punch_id) if chat.missing_punch_id else None
         yield sse({"type": "done", "session_id": chat.id, "status": final_status, "current_node": current_node, "terminal": terminal, **repair_result_payload(final_status, current_node, terminal, missing)}, event="done")
     return StreamingResponse(gen(), media_type="text/event-stream")

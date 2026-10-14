@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
 from sqlalchemy import select
@@ -23,6 +23,10 @@ except Exception:  # pragma: no cover - 允许未安装依赖时后端仍可启�
 
 def _punch_label(value: str) -> str:
     return "上班卡" if value == "ON_DUTY" else "下班卡"
+
+
+# 滑动窗口大小：最近 HISTORY_WINDOW 条消息原文保留，更早的压缩进会话 summary。
+HISTORY_WINDOW = 8
 
 
 # ReAct Agent 的系统提示词：告诉模型何时查数据、何时触发补卡，以及严禁编造补卡记录 id。
@@ -75,12 +79,51 @@ class AutoClockAgent:
         lines.append("例如：回复“选第 1 条”或“补编号 12”。")
         return "\n".join(lines)
 
-    async def _load_recent_messages(self, session_id: int | None) -> list[ChatMessage]:
-        # 加载最近聊天历史，解决“选第1条”这类依赖上下文（上轮查询结果）的问题。
+    async def _load_window_messages(self, session_id: int | None) -> list[ChatMessage]:
+        # 滑动窗口：只取最近 HISTORY_WINDOW 条原文，更早的由 chat.summary 摘要承接。
         if not session_id:
             return []
-        result = await self.db.execute(select(ChatMessage).where(ChatMessage.session_id == session_id).order_by(ChatMessage.id.desc()).limit(12))
+        result = await self.db.execute(
+            select(ChatMessage).where(ChatMessage.session_id == session_id).order_by(ChatMessage.id.desc()).limit(HISTORY_WINDOW)
+        )
         return list(reversed(result.scalars().all()))
+
+    def _make_model(self):
+        return ChatOpenAI(
+            model=settings.openai_model,
+            api_key=settings.openai_api_key,
+            base_url=settings.openai_base_url or None,
+            temperature=0,
+        )
+
+    async def _summarize_history(self, existing_summary: str | None, overflow: list[ChatMessage]) -> str:
+        # 把已有摘要和滑出窗口的旧消息合并成一段简洁摘要，控制后续上下文长度。
+        lines = "\n".join(f"{m.role}: {m.content}" for m in overflow)
+        prompt = (
+            "你是对话摘要器。请把下面「已有摘要」和「新增对话」合并成一段简洁摘要（不超过 150 字），"
+            "保留关键信息：用户想补的卡、已选择的补卡记录编号、补卡结果 / 审核状态等。\n\n"
+            f"已有摘要：\n{existing_summary or '（无）'}\n\n"
+            f"新增对话：\n{lines}\n\n"
+            "只输出摘要本身，不要额外解释。"
+        )
+        resp = await self._make_model().ainvoke([HumanMessage(content=prompt)])
+        content = resp.content if isinstance(resp.content, str) else str(resp.content)
+        return content.strip()
+
+    async def refresh_summary(self, chat: ChatSession) -> None:
+        # 会话消息超过滑动窗口后，把窗口之外的旧消息压缩进 chat.summary。
+        result = await self.db.execute(select(ChatMessage).where(ChatMessage.session_id == chat.id).order_by(ChatMessage.id.asc()))
+        msgs = list(result.scalars().all())
+        if len(msgs) <= HISTORY_WINDOW:
+            chat.summary = None
+        else:
+            overflow = msgs[:-HISTORY_WINDOW]
+            try:
+                chat.summary = await self._summarize_history(chat.summary, overflow)
+            except Exception:
+                # 摘要失败不影响主流程，保留旧摘要即可。
+                pass
+        await self.db.commit()
 
     async def _execute_repair(self, missing_punch_id: int, chat: ChatSession) -> str:
         # 确定性补卡流程（合并原先 load_selected_record / check_leader_policy / auto_repair / request_leader_approval 四个节点）：
@@ -133,12 +176,7 @@ class AutoClockAgent:
             self.outcome = {"terminal": True, "status": "FAILED", "missing_punch_id": None}
             return
 
-        model = ChatOpenAI(
-            model=settings.openai_model,
-            api_key=settings.openai_api_key,
-            base_url=settings.openai_base_url or None,
-            temperature=0,
-        )
+        model = self._make_model()
 
         # 用闭包定义工具并捕获 self / chat，避免 @tool 直接装饰方法时把 self 当成工具参数。
         @tool
@@ -162,9 +200,10 @@ class AutoClockAgent:
 
         react = create_react_agent(model, [query_missing_punches, repair_missing_punch, get_current_date], prompt=SYSTEM_PROMPT)
 
-        history = await self._load_recent_messages(chat.id)
-        prior = [HumanMessage(content=m.content) if m.role == "user" else AIMessage(content=m.content) for m in history]
-        inputs = {"messages": prior + [HumanMessage(content=message)]}
+        window = await self._load_window_messages(chat.id)
+        prior = [HumanMessage(content=m.content) if m.role == "user" else AIMessage(content=m.content) for m in window]
+        prefix = [SystemMessage(content=f"以下是之前对话的摘要，供你理解上下文：\n{chat.summary}")] if chat.summary else []
+        inputs = {"messages": prefix + prior + [HumanMessage(content=message)]}
 
         try:
             async for step in react.astream(inputs, stream_mode="updates"):

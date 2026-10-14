@@ -15,6 +15,7 @@ class ChatSession(Base):
     title: Mapped[str] = mapped_column(String(255), nullable=False, default="补卡会话")
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="ACTIVE")
     current_node: Mapped[str] = mapped_column(String(64), nullable=False, default="start")
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 

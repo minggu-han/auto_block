@@ -71,10 +71,12 @@ CREATE TABLE auto_block_chat_sessions (
     title VARCHAR(255) NOT NULL DEFAULT '补卡会话',
     status VARCHAR(32) NOT NULL DEFAULT 'ACTIVE',
     current_node VARCHAR(64) NOT NULL DEFAULT 'start',
+    summary TEXT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 COMMENT ON TABLE auto_block_chat_sessions IS '补卡 Agent 聊天会话记录';
+COMMENT ON COLUMN auto_block_chat_sessions.summary IS '滑动窗口之外的旧消息摘要，用于控制上下文长度';
 
 CREATE TABLE auto_block_chat_messages (
     id SERIAL PRIMARY KEY,
